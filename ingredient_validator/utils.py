@@ -1,9 +1,10 @@
 import functools
-import time
+from timeit import default_timer as timer
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Callable
 
+import aiohttp
 import httpx
 import orjson
 from loguru import logger
@@ -14,9 +15,9 @@ def timeit(func: Callable) -> Callable:
 
     @functools.wraps(func)
     def wrapped(*args, **kwargs):
-        start = time.time()
+        start = timer()
         result = func(*args, **kwargs)
-        duration = time.time() - start
+        duration = timer() - start
         logger.debug(f"'{func.__name__}' executed in {duration:.3f}s")
         return result
 
@@ -28,6 +29,13 @@ def retry_only_on_real_errors(exc: Exception) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code >= 500
     return isinstance(exc, httpx.HTTPError)
+
+
+def retry_only_on_real_errors_aiohttp(exc: Exception) -> bool:
+    """Retry only on server errors (5xx) or network-related issues for aiohttp."""
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return exc.status >= 500
+    return isinstance(exc, aiohttp.ClientError)
 
 
 class FileManager:

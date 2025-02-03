@@ -1,5 +1,4 @@
 from openfoodfacts import Lang
-
 from ingredient_validator.ingredients_validator import IngredientValidator
 from ingredient_validator.utils import timeit
 
@@ -13,6 +12,9 @@ def main():
 
     # Step 2: Pre-process the data
     fetcher.preprocess_ingredients(force_refresh=False)
+
+    # Step 3: Validate ingredients using DWDS API
+    fetcher.validate_ingredients_with_dwds(force_refresh=True)
 
 
 if __name__ == "__main__":
