@@ -1,8 +1,9 @@
 import functools
-from timeit import default_timer as timer
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Callable
+from timeit import default_timer as timer
+from typing import Any, Callable, Dict, List
 
 import aiohttp
 import httpx
@@ -59,3 +60,27 @@ class FileManager:
         """Save JSON data to a file."""
         with open(filepath, "wb") as f:
             f.write(orjson.dumps(data))
+
+
+def extract_food_words(leipzig: Dict[str, List[str]]) -> List[str]:
+    """
+    Given a Leipzig groups dictionary (word -> list of category strings),
+    return a sorted list of words that are likely food-related.
+
+    A word is considered food-related if any of its categories matches one of:
+      - A food category code (16.5, 16.6, 16.7, 16.8, 16.13, 16.14, or 16.15).
+      - Explicitly labeled as "Gastronomie/Kulinarik".
+    """
+    # Precompile the regex pattern for performance and clarity.
+    pattern = re.compile(
+        r"(16\.(?:5|6|7|8|13|14|15)|Gastronomie/Kulinarik|Kochkunst|Nahrungsmittel|Nahrung)"
+    )
+    food_words = sorted(
+        word
+        for word, categories in leipzig.items()
+        if any(pattern.search(cat) for cat in categories)
+    )
+    logger.info(
+        f"Found {len(food_words)} food related words that are currently unknown."
+    )
+    return food_words
