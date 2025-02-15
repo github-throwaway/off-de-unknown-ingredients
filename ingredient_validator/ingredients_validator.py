@@ -28,7 +28,7 @@ class IngredientValidator:
     def __init__(self, lang: Lang, cache_dir: Path = Path("cache")):
         self.corpus = None
         self.validated_ingredients = None
-        self.leipzig_semaphore = asyncio.Semaphore(100)
+        self.leipzig_semaphore = asyncio.Semaphore(50)
         self.lang = lang
         self.timeout = 90
         self.cache_dir = cache_dir
@@ -81,7 +81,6 @@ class IngredientValidator:
 
             filtered_ingredients = filtered_df.get_column("name").to_list()
 
-            # Save processed ingredients to file and update in-memory cache.
             self.file_manager.save_json(
                 self.processed_ingredients_fp, filtered_ingredients
             )
@@ -142,7 +141,7 @@ class IngredientValidator:
     def validate_ingredients_with_dwds(
         self, force_refresh: bool = False
     ) -> Dict[str, Any]:
-        """Validate ingredients using the DWDS API, processing only unvalidated ingredients."""
+        """Validate ingredients using the DWDS API."""
         logger.info("Validating ingredients with DWDS API...")
 
         if not force_refresh and self.file_manager.is_file_current(
@@ -249,78 +248,76 @@ class IngredientValidator:
             logger.error(f"Unexpected error for {url}: {e}")
             return {"valid": set(), "invalid": set(batch)}
 
-    async def _fetch_dornseiff_entry(
+    async def fetch_primary(
         self, session: aiohttp.ClientSession, corpus: str, word: str
+    ) -> List[str]:
+        """Fetch groups using the primary endpoint."""
+        primary_url = (
+            f"https://corpora.uni-leipzig.de/de/webservice/index"
+            f"?corpusId={corpus}&action=loadWordSetBox&word={word}"
+        )
+        async with session.get(primary_url, timeout=self.timeout) as response:
+            response.raise_for_status()
+            primary_text = await response.text()
+            groups = re.findall(r"\d+\.\d+ [A-Za-zäöüßÄÖÜ, ]+", primary_text)
+        return groups
+
+    async def fetch_fallback(
+        self, session: aiohttp.ClientSession, corpus: str, word: str
+    ) -> List[str]:
+        secondary_url = (
+            f"https://corpora.uni-leipzig.de/de/res?corpusId={corpus}&word={word}"
+        )
+
+        async with session.get(secondary_url, timeout=self.timeout) as get_response:
+            get_response.raise_for_status()
+            secondary_text = await get_response.text()
+            match = re.search(
+                r"<b>Sachgebiet:</b>\s*([A-Za-zäöüßÄÖÜ\-, ]+)<br/>", secondary_text
+            )
+            return (
+                [topic.strip() for topic in match.group(1).split(",")] if match else []
+            )
+
+    async def _fetch_dornseiff_entry(
+        self,
+        session: aiohttp.ClientSession,
+        corpus: str,
+        word: str,
+        fallback: bool = True,
     ) -> Tuple[str, List[str]]:
-        # Limit concurrent requests.
-        async with self.leipzig_semaphore:
-            primary_url = (
-                f"https://corpora.uni-leipzig.de/de/webservice/index"
-                f"?corpusId={corpus}&action=loadWordSetBox&word={word}"
-            )
+        try:
+            groups_primary = await self.fetch_primary(session, corpus, word)
+        except Exception as e:
+            logger.debug(f"Primary call failed for '{word}': {e!r}")
             groups_primary = []
+
+        if groups_primary:
+            return word, groups_primary
+
+        if fallback:
             try:
-                async with session.get(primary_url) as response:
-                    response.raise_for_status()
-                    primary_text = await response.text()
-                    # Extract groups using a regex pattern.
-                    groups_primary = re.findall(
-                        r"\d+\.\d+ [A-Za-zäöüßÄÖÜ, ]+", primary_text
-                    )
-                    # logger.debug(f"Primary endpoint for '{word}' returned {groups_primary}")
+                groups_fallback = await self.fetch_fallback(session, corpus, word)
             except Exception as e:
-                # Enhanced logging: include exception representation.
-                logger.debug(f"Primary endpoint error for '{word}': {e!r}")
+                logger.debug(f"Fallback call failed for '{word}': {e!r}")
+                groups_fallback = []
+            return word, groups_fallback
 
-            # If primary returns data, do not call fallback.
-            if groups_primary:
-                return word, groups_primary
-
-            secondary_url = (
-                f"https://corpora.uni-leipzig.de/de/res?corpusId={corpus}&word={word}"
-            )
-            groups_secondary = []
-            try:
-                async with session.get(secondary_url) as response:
-                    if response.status == 404:
-                        pass
-                        # logger.debug(f"Fallback endpoint 404 for '{word}'")
-                    else:
-                        response.raise_for_status()
-                        secondary_text = await response.text()
-                        match = re.search(
-                            r"<b>Sachgebiet:</b>\s*([A-Za-zäöüßÄÖÜ\-, ]+)<br/>",
-                            secondary_text,
-                        )
-                        if match:
-                            groups_secondary = [
-                                topic.strip() for topic in match.group(1).split(",")
-                            ]
-                            # logger.debug(f"Fallback endpoint for '{word}' returned {groups_secondary}")
-            except Exception as e:
-                # Enhanced logging: include exception representation.
-                logger.debug(f"Fallback endpoint error for '{word}': {e!r}")
-
-            return word, groups_secondary
+        return word, groups_primary
 
     @timeit
     def fetch_dornseiff_bedeutungsgruppe(
-        self, corpus: str = "deu_news_2024", force_refresh: bool = False
+        self,
+        corpus: str = "deu_news_2024",
+        force_refresh: bool = False,
+        fallback: bool = True,
     ) -> Dict[str, List[str]]:
-        """
-        Fetch Dornseiff-Bedeutungsgruppen for each validated ingredient word.
-        For each word:
-          - Call the primary endpoint.
-          - If primary returns data, then call fallback endpoint.
-          - Use fallback's result if available.
-        Delta and force-refresh logic is maintained.
-        """
         logger.info(f"Fetching Dornseiff-Bedeutungsgruppen from {corpus} corpus")
         self.corpus = corpus
         leipzig_fp = self._get_leipzig_fp(corpus)
 
         cached_results = {}
-        if not force_refresh and self.file_manager.is_file_current(leipzig_fp):
+        if not force_refresh:
             cached_results = self.file_manager.load_json(leipzig_fp)
 
         valid_words = set(self.validated_ingredients["valid"])
@@ -329,23 +326,23 @@ class IngredientValidator:
         if delta_words:
 
             async def process_entries():
-                # Increase concurrent connections to speed up network calls.
-                connector = aiohttp.TCPConnector(
-                    limit=500
-                )  # increased connection limit
                 async with aiohttp.ClientSession(
                     headers=self.user_agent,
                     timeout=aiohttp.ClientTimeout(total=self.timeout),
-                    connector=connector,
                 ) as session:
-                    tasks = [
-                        self._fetch_dornseiff_entry(session, corpus, word)
-                        for word in delta_words
-                    ]
+                    sem = asyncio.Semaphore(50)
+
+                    async def fetch_word(word: str) -> Tuple[str, List[str]]:
+                        async with sem:
+                            return await self._fetch_dornseiff_entry(
+                                session, corpus, word, fallback
+                            )
+
+                    tasks = [fetch_word(word) for word in delta_words]
                     results = {}
+
                     with tqdm(
-                        total=len(tasks),
-                        desc=f"Fetching Leipzig groups for {corpus}",
+                        total=len(tasks), desc=f"Fetching Leipzig groups for {corpus}"
                     ) as pbar:
                         for future in asyncio.as_completed(tasks):
                             word, groups = await future
@@ -359,8 +356,6 @@ class IngredientValidator:
 
         return cached_results
 
-    # The remaining methods (fetch_openthesaurus_category, _async_scrape_openthesaurus, combine, get_product_count)
-    # remain unchanged.
     @timeit
     def fetch_openthesaurus_category(
         self, category: str, force_refresh: bool = False
@@ -441,7 +436,7 @@ class IngredientValidator:
         return {term: category for term in unique_terms}
 
     @timeit
-    def combine(self) -> dict:
+    def combine_opent_and_dornseiff(self) -> dict:
         leipzig_cache = self._get_leipzig_fp(self.corpus)
         dornseiff_bedeutungsgruppe = self.file_manager.load_json(leipzig_cache)
         openthesaurus_results = self.file_manager.load_json(self.openthesaurus_fp)
@@ -460,7 +455,6 @@ class IngredientValidator:
         prefix = f"{self.lang.value}:"
         ingredient_lookup = {f"{prefix}{ing.lower()}" for ing in ingredients}
 
-        # Single-pass dictionary comprehension
         counts = {
             tag["id"].lower(): tag["products"]
             for tag in self.unknown_ingredients["tags"]

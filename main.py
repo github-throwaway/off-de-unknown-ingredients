@@ -22,12 +22,13 @@ def main() -> None:
 
     # Step 4: Get Dornseiff-Bedeutungsgruppen
     fetcher.fetch_dornseiff_bedeutungsgruppe(
-        corpus="deu_news_2024", force_refresh=False
+        corpus="deu_news_2024", force_refresh=False, fallback=False
     )
 
     # Step 5: OpenThesaurus
     fetcher.fetch_openthesaurus_category("Gastronomie/Kulinarik", force_refresh=False)
-    res = fetcher.combine()
+
+    res = fetcher.combine_opent_and_dornseiff()
 
     unknown_valid_ingredients = extract_food_words(res)
     count = fetcher.get_product_count(unknown_valid_ingredients)
