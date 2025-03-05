@@ -16,6 +16,7 @@ from loguru import logger
 from openfoodfacts import Lang
 from tqdm import tqdm
 
+from .spell_checker import check_spelling
 from .utils import (
     FileManager,
     retry_only_on_real_errors,
@@ -26,6 +27,7 @@ from .utils import (
 
 class IngredientValidator:
     def __init__(self, lang: Lang, cache_dir: Path = Path("cache")):
+        self.original_invalid = None
         self.corpus = None
         self.validated_ingredients = None
         self.leipzig_semaphore = asyncio.Semaphore(50)
@@ -34,7 +36,7 @@ class IngredientValidator:
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(exist_ok=True)
         self.url = (
-            f"https://{self.lang.value}.openfoodfacts.org/ingredients"
+            f"https://{self.lang.value}.openfoodfacts.org/facets/ingredients"
             f".json?status=unknown"
         )
         self.user_agent = {"User-Agent": f"MyApp/{platform.python_version()}"}
@@ -47,16 +49,19 @@ class IngredientValidator:
         self.validated_ingredients_fp = (
             self.cache_dir / f"2_dwds_validated_ingredients_{self.lang.value}.json"
         )
+        self.spell_corrections_fp = (
+            self.cache_dir / f"3_spell_corrections_{self.lang.value}.json"
+        )
         self.filtered_ingredients = None
         self.unknown_ingredients = None
         self.file_manager = FileManager()
         self.max_url_length = 2048
         self.dwds_api_url = "https://www.dwds.de/api/wb/snippet/?q="
         self.leipzig_fp_template = (
-            self.cache_dir / f"3_leipzig_{{corpus}}_{self.lang.value}.json"
+            self.cache_dir / f"4_leipzig_{{corpus}}_{self.lang.value}.json"
         )
         self.openthesaurus_fp = (
-            self.cache_dir / "4_openthesaurus_Gastronomie_Kulinarik.json"
+            self.cache_dir / "5_openthesaurus_Gastronomie_Kulinarik.json"
         )
 
     def _get_leipzig_fp(self, corpus: str) -> Path:
@@ -462,3 +467,135 @@ class IngredientValidator:
         }
 
         return OrderedDict(sorted(counts.items(), key=itemgetter(1), reverse=True))
+
+    @timeit
+    def validate_spell_corrections(
+        self, dictionary_path: str, force_refresh: bool = False
+    ) -> None:
+        """Validate spelling corrections for invalid ingredients with caching."""
+        invalid_words = self.validated_ingredients.get("invalid", [])
+        if not invalid_words:
+            logger.info("No invalid words to spell check.")
+            return
+
+        logger.info(f"Spell checking {len(invalid_words)} invalid words...")
+
+        # Load cached spell corrections if available.
+        spell_corrected = {}
+        if not force_refresh:
+            spell_corrected = self.file_manager.load_json(self.spell_corrections_fp)
+            if spell_corrected:
+                logger.info(
+                    f"Loaded {len(spell_corrected)} spell corrections from cache"
+                )
+            else:
+                logger.info("Cache is empty; running spell correction...")
+                spell_corrected = asyncio.run(
+                    check_spelling(invalid_words, Path(dictionary_path))
+                )
+                self.file_manager.save_json(self.spell_corrections_fp, spell_corrected)
+                logger.info(f"Cached {len(spell_corrected)} spell corrections")
+        else:
+            spell_corrected = asyncio.run(
+                check_spelling(invalid_words, Path(dictionary_path))
+            )
+            self.file_manager.save_json(self.spell_corrections_fp, spell_corrected)
+            logger.info(f"Cached {len(spell_corrected)} spell corrections")
+
+        corrected_candidates = list(
+            {
+                correction
+                for suggestions in spell_corrected.values()
+                for correction in suggestions
+            }
+        )
+
+        if not corrected_candidates:
+            logger.info("No spelling corrections found.")
+            return
+
+        logger.info(
+            f"Validating {len(corrected_candidates)} spell-corrected candidates..."
+        )
+        # Validate only new candidates.
+        self.ensure_dwds_validated(set(corrected_candidates))
+
+        logger.info(
+            f"Updated validation counts after spell check - "
+            f"Valid: {len(self.validated_ingredients['valid'])}, "
+            f"Invalid: {len(self.validated_ingredients['invalid'])}"
+        )
+
+    def store_original_invalid(self) -> None:
+        """
+        Store the original invalid words from DWDS validation before spell correction.
+        Call this method immediately before running spell correction.
+        """
+        self.original_invalid = self.validated_ingredients.get("invalid", []).copy()
+
+    @timeit
+    def get_food_related_misspelling_mapping(self, final_food_words: set) -> dict:
+        """
+        Returns mapping using cached spell corrections, only for food-related terms.
+        """
+        if not self.original_invalid:
+            logger.warning(
+                "No stored invalid words available for spell correction mapping."
+            )
+            return {}
+
+        if not self.spell_corrections_fp.exists():
+            logger.warning("Spell corrections cache missing - run validation first")
+            return {}
+
+        spell_corrections = self.file_manager.load_json(self.spell_corrections_fp)
+
+        # Filter to only corrections for originally invalid words.
+        relevant_corrections = {
+            word: suggestions
+            for word, suggestions in spell_corrections.items()
+            if word in self.original_invalid
+        }
+
+        valid_candidate_set = set(self.validated_ingredients.get("valid", []))
+
+        # Normalize food words for matching.
+        normalized_food = {word.lower() for word in final_food_words}
+
+        # Build final mapping.
+        mapping = {}
+        for misspelled, suggestions in relevant_corrections.items():
+            for candidate in suggestions:
+                if (
+                    candidate in valid_candidate_set
+                    and candidate.lower() in normalized_food
+                ):
+                    mapping[misspelled] = candidate
+                    break  # Use first valid candidate.
+
+        logger.info(f"Found {len(mapping)} food-related spelling corrections")
+        return mapping
+
+    def ensure_dwds_validated(self, words: set) -> dict:
+        """
+        Ensure that the given words have been validated via DWDS.
+        Validated words already stored in self.validated_ingredients are reused.
+        New words (delta) are validated and then merged into the cache.
+        """
+        # Initialize validated data if not already present.
+        validated = self.validated_ingredients or {"valid": [], "invalid": []}
+        already_validated = set(validated.get("valid", [])) | set(
+            validated.get("invalid", [])
+        )
+        delta = words - already_validated
+        if delta:
+            logger.info(f"Validating {len(delta)} new words with DWDS API...")
+            new_results = asyncio.run(self._async_validate_words(delta))
+            validated["valid"].extend(new_results["valid"])
+            validated["invalid"].extend(new_results["invalid"])
+            # Deduplicate the results.
+            validated["valid"] = sorted(set(validated["valid"]))
+            validated["invalid"] = sorted(set(validated["invalid"]))
+            self.validated_ingredients = validated
+            self.file_manager.save_json(self.validated_ingredients_fp, validated)
+        return validated

@@ -7,3 +7,4 @@ polars~=1.21.0
 stamina~=24.3.0
 beautifulsoup4~=4.13.3
 tqdm~=4.67.1
+googletrans~=4.0.2
